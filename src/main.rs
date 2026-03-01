@@ -221,6 +221,25 @@ struct AppState {
     last_find_flags: u32,
 }
 
+#[derive(Clone, Copy)]
+struct AppSettings {
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+    show_status_bar: bool,
+    word_wrap: bool,
+    encoding: TextEncoding,
+    logfont: LOGFONTW,
+    has_logfont: bool,
+}
+
+struct AppLaunchData {
+    locale: &'static Locale,
+    initial_path: Vec<u16>,
+    settings: AppSettings,
+}
+
 struct FindReplaceState {
     dlg_hwnd: HWND,
     fr: FINDREPLACEW,
@@ -424,6 +443,24 @@ fn is_word_char_u16(ch: u16) -> bool {
 
 fn wide_null(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(Some(0)).collect()
+}
+
+fn default_app_launch_data(locale: &'static Locale) -> AppLaunchData {
+    AppLaunchData {
+        locale,
+        initial_path: Vec::new(),
+        settings: AppSettings {
+            x: CW_USEDEFAULT,
+            y: CW_USEDEFAULT,
+            width: 900,
+            height: 650,
+            show_status_bar: true,
+            word_wrap: false,
+            encoding: TextEncoding::Utf8Bom,
+            logfont: unsafe { zeroed() },
+            has_logfont: false,
+        },
+    }
 }
 
 
@@ -1725,12 +1762,13 @@ unsafe extern "system" fn wnd_proc(
     match msg {
         WM_CREATE => {
             let cs = lparam as *const CREATESTRUCTW;
-            let locale = if cs.is_null() {
-                &JA
+            let launch = if cs.is_null() || (*cs).lpCreateParams.is_null() {
+                Box::new(default_app_launch_data(&JA))
             } else {
-                &*(((*cs).lpCreateParams) as *const Locale)
+                Box::from_raw((*cs).lpCreateParams as *mut AppLaunchData)
             };
-            let edit = create_edit_control(hwnd, false);
+            let locale = launch.locale;
+            let edit = create_edit_control(hwnd, launch.settings.word_wrap);
             let status = CreateWindowExW(
                 0,
                 STATUSCLASSNAMEW,
@@ -1748,12 +1786,12 @@ unsafe extern "system" fn wnd_proc(
             let state = Box::new(AppState {
                 edit_hwnd: edit,
                 status_hwnd: status,
-                show_status_bar: true,
-                word_wrap: false,
+                show_status_bar: launch.settings.show_status_bar,
+                word_wrap: launch.settings.word_wrap,
                 hfont: null_mut(),
-                logfont: zeroed(),
-                current_encoding: TextEncoding::Utf8Bom,
-                current_path: Vec::new(),
+                logfont: launch.settings.logfont,
+                current_encoding: launch.settings.encoding,
+                current_path: launch.initial_path.clone(),
                 locale,
                 find_msg: RegisterWindowMessageW(FINDMSGSTRINGW),
                 find_dialog: None,
@@ -1764,17 +1802,49 @@ unsafe extern "system" fn wnd_proc(
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(state) as isize);
             DragAcceptFiles(hwnd, 1);
             if let Some(st) = get_state(hwnd) {
+                if launch.settings.has_logfont {
+                    let font = CreateFontIndirectW(&launch.settings.logfont);
+                    if !font.is_null() {
+                        st.hfont = font;
+                        apply_font_to_edit(st);
+                    }
+                }
                 let menu = build_menu(st.locale);
                 SetMenu(hwnd, menu);
-                CheckMenuItem(GetMenu(hwnd), ID_VIEW_STATUS_BAR as u32, MF_BYCOMMAND | MF_CHECKED);
+                CheckMenuItem(
+                    GetMenu(hwnd),
+                    ID_VIEW_STATUS_BAR as u32,
+                    MF_BYCOMMAND | if st.show_status_bar { MF_CHECKED } else { MF_UNCHECKED },
+                );
                 CheckMenuItem(
                     GetMenu(hwnd),
                     ID_FORMAT_WORD_WRAP as u32,
-                    MF_BYCOMMAND | MF_UNCHECKED,
+                    MF_BYCOMMAND | if st.word_wrap { MF_CHECKED } else { MF_UNCHECKED },
                 );
+                if !st.show_status_bar {
+                    ShowWindow(st.status_hwnd, SW_HIDE);
+                }
+                if launch.settings.width > 0
+                    && launch.settings.height > 0
+                    && launch.settings.x != CW_USEDEFAULT
+                    && launch.settings.y != CW_USEDEFAULT
+                {
+                    MoveWindow(
+                        hwnd,
+                        launch.settings.x,
+                        launch.settings.y,
+                        launch.settings.width,
+                        launch.settings.height,
+                        1,
+                    );
+                }
                 update_title(hwnd, st);
                 update_status_bar(st);
                 layout_children(hwnd, st);
+                if !st.current_path.is_empty() {
+                    let path = st.current_path.clone();
+                    open_path_into_editor(hwnd, st, &path, st.current_encoding);
+                }
             }
             SetTimer(hwnd, ID_TIMER_STATUS, 120, None);
             0
@@ -2050,6 +2120,13 @@ fn main() {
         };
         InitCommonControlsEx(&mut icc);
 
+        let launch = Box::new(default_app_launch_data(locale));
+        let launch_x = launch.settings.x;
+        let launch_y = launch.settings.y;
+        let launch_w = launch.settings.width;
+        let launch_h = launch.settings.height;
+        let launch_ptr = Box::into_raw(launch);
+
         let class_name = wide_null(APP_CLASS);
         let window_title = wide_null(APP_NAME);
         let wnd = WNDCLASSW {
@@ -2068,16 +2145,17 @@ fn main() {
             class_name.as_ptr(),
             window_title.as_ptr(),
             WS_OVERLAPPEDWINDOW | WS_VISIBLE,
-            CW_USEDEFAULT,
-            CW_USEDEFAULT,
-            900,
-            650,
+            launch_x,
+            launch_y,
+            launch_w,
+            launch_h,
             null_mut(),
             null_mut(),
             instance,
-            locale as *const Locale as *const _,
+            launch_ptr as *const _,
         );
         if hwnd.is_null() {
+            let _ = Box::from_raw(launch_ptr);
             return;
         }
 
